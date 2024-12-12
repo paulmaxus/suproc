@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = 'setuptools.build_meta'
+
+[project]
+name = "suproc"
+description = "Python library for processing smartphone usage data"
+authors = [
+    {name = "Max Paulus"}
+]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3"
+]
+#license = {text = "MIT"}
+dependencies = [
+    "pandas"
+]
+dynamic = ["version"]
+requires-python = ">=3.8"
+
+[tool.setuptools]
+packages = ["suproc"]
