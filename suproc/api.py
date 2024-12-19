@@ -102,14 +102,14 @@ class Processor:
         by_esm = []
         for formc, ffdt in zip(self.esm.formc, self.esm.form_finish_datetime):
             df = self._filter_by_hours_prior(df_in, event_time=ffdt, hours=hours_prior)
-            df["duration"] = df.datetime_end.apply(lambda x: min(x, ffdt)) - df.datetime_start  # maximum duration is until end of esm
+            df["screentime"] = df.datetime_end.apply(lambda x: min(x, ffdt)) - df.datetime_start  # maximum screentime is until end of esm
             # Unit should be minutes
-            df["duration"] = df.duration.apply(lambda x: x.total_seconds() / 60)
-            if group is not None:
-                df = df.groupby(group).duration.sum().reset_index()
+            df["screentime"] = df.screentime.apply(lambda x: x.total_seconds() / 60)
+            if group:
+                df = df.groupby(group).screentime.sum().reset_index()
                 by_esm.append((formc, df))
             else:
-                by_esm.append((formc, df.duration.sum()))
+                by_esm.append((formc, df.screentime.sum()))
         return by_esm
     
     def by_period(self, df_in, period="day", group=None):
@@ -138,7 +138,7 @@ class Processor:
 
         df["new_datetime_start"] = df[['datetime_start','datetime_start_period']].max(axis=1)
         df["new_datetime_end"] = df[['datetime_end','datetime_end_period']].min(axis=1)
-        df["duration"] = df.new_datetime_end - df.new_datetime_start
+        df["screentime"] = df.new_datetime_end - df.new_datetime_start
 
         match period: 
             case "day":
@@ -149,9 +149,9 @@ class Processor:
                 df["by_period"] = df.period.apply(lambda x: x.hour)
 
         extra_group = [group] if group is not None else []
-        df =  df.groupby(["by_period"] + extra_group).duration.sum().reset_index()
+        df =  df.groupby(["by_period"] + extra_group).screentime.sum().reset_index()
         # Unit in minutes is required
-        df["duration"] = df.duration.apply(lambda x: x.total_seconds() / 60)
+        df["screentime"] = df.screentime.apply(lambda x: x.total_seconds() / 60)
         return df
 
 
@@ -174,6 +174,8 @@ class ScreenTime(Processor):
     
     def by_esm(self, hours_prior=2):
         screen_time = super().by_esm(self.screen_time, hours_prior=hours_prior)
+        if not screen_time:
+            return pd.DataFrame()
         return pd.DataFrame(screen_time, columns=["formc","screen_time"])
     
     def by_period(self, period="day"):
@@ -183,7 +185,7 @@ class ScreenTime(Processor):
     
 class AppUsage(Processor):
 
-    def __init__(self, data: Data):
+    def __init__(self, data: Data, all_apps=False):
         super().__init__(data)
         self.platforms = [
             "facebook", 
@@ -199,10 +201,10 @@ class AppUsage(Processor):
             "pinterest", 
             "linkedin"
         ]
-        self.app_usage = self._preprocess_app_usage(data.app_usage)
+        self.app_usage = self._preprocess_app_usage(data.app_usage, all_apps=all_apps)
 
 
-    def _preprocess_app_usage(self, app_usage):
+    def _preprocess_app_usage(self, app_usage, all_apps):
         df = app_usage.copy()
         df["datetime_start"] = df.timestamp.apply(lambda x: self.ts_start + datetime.timedelta(seconds=x))
         df["datetime_end"] = df.datetime_start.shift(-1)
@@ -211,7 +213,8 @@ class AppUsage(Processor):
         # Add platform
         df['platform'] = df.event.str.extract(f"({'|'.join(self.platforms)})")
         # Remove events with no platform
-        df = df[~pd.isna(df.platform)]
+        if not all_apps:
+            df = df[~pd.isna(df.platform)]
         
         return df
     
@@ -221,10 +224,48 @@ class AppUsage(Processor):
         for formc, df in app_times:
             df["formc"] = formc
             app_time = pd.concat([app_time, df])
-        return app_time.pivot(index="formc", columns="platform", values="duration")
+        if app_time.empty:
+            return app_time
+        else:
+            return app_time.pivot(index="formc", columns="platform", values="screentime")
     
     def by_period(self, period="day"):
         app_time = super().by_period(self.app_usage, period=period, group="platform")
         # For plotting, pivot and set index
-        return app_time.reset_index().pivot(index="by_period", columns="platform", values="duration")
-    
+        return app_time.reset_index().pivot(index="by_period", columns="platform", values="screentime")
+
+class Pipeline:
+
+    def __init__(self, data_loader: DataLoader, processors: list[Processor], period="day", hours_prior=2):
+        self.data_loader = data_loader
+        self.processors = processors
+        self.period = period
+        self.hours_prior = hours_prior
+
+    def run(self):
+        dfp_all = pd.DataFrame()
+        dfe_all = pd.DataFrame()
+        for data in self.data_loader:
+            dfp = pd.DataFrame()
+            dfe = pd.DataFrame()
+            for processor in self.processors:
+                p = processor(data)
+                # by period
+                bp = p.by_period(period=self.period).reset_index()
+                if dfp.empty:
+                    dfp = bp
+                elif not bp.empty:
+                    dfp = pd.merge(dfp, bp, how="outer", on="by_period")
+                # by esm
+                be = p.by_esm(hours_prior=self.hours_prior)
+                if dfe.empty:
+                    dfe = be
+                elif not be.empty:
+                    dfe = pd.merge(dfe, be, how="outer", on="formc")
+            if not dfp.empty:
+                dfp["id"] = data.id
+                dfp_all = pd.concat([dfp_all, dfp])
+            if not dfe.empty:
+                dfe["id"] = data.id
+                dfe_all = pd.concat([dfe_all, dfe])
+        return dfp_all, dfe_all
