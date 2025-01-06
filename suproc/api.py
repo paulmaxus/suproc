@@ -4,6 +4,7 @@ import datetime
 import zipfile
 
 from pathlib import Path
+from datetime import timedelta
 
 
 class DataLoader:
@@ -163,12 +164,16 @@ class ScreenTime(Processor):
 
     def _preprocess_display_on(self, display_on):
         df = display_on.copy()
+        # sometimes timestamps are not unique!
+        df = df.drop_duplicates(subset=["timestamp"], keep="first")
+        df = df.sort_values(by="timestamp", ascending=True)
         df["datetime_start"] = df.timestamp.apply(lambda x: self.ts_start + datetime.timedelta(seconds=x))
         df["datetime_end"] = df.datetime_start.shift(-1)
         # Remove last event as we don't know when it ended
         df = df.iloc[:-1,:]   
         # Remove display off events
         df = df[df.is_on==1]
+        df = df.reset_index(drop=True)
         
         return df
     
@@ -233,6 +238,36 @@ class AppUsage(Processor):
         app_time = super().by_period(self.app_usage, period=period, group="platform")
         # For plotting, pivot and set index
         return app_time.reset_index().pivot(index="by_period", columns="platform", values="screentime")
+
+class Diagnostics:
+
+    def __init__(self, screen_time, app_usage):
+        self.screen_time = screen_time.screen_time.copy()
+        self.app_usage = app_usage.app_usage.copy()
+        self.screen_time["timedelta_screentime"] = self.screen_time.apply(lambda row: (row["datetime_end"] - row["datetime_start"]), axis=1)
+        self.screen_time["timedelta_app_usage"] = self.screen_time.apply(lambda row: self._calculate_app_usage(row["datetime_start"], row["datetime_end"], self.app_usage), axis=1)
+
+    def _calculate_app_usage(self, st_start, st_end, au):
+        au_sub = au[(au["datetime_start"] < st_end) & (au["datetime_end"] > st_start)]
+        td = au_sub.apply(lambda row: min(row["datetime_end"], st_end) - max(row["datetime_start"], st_start), axis=1)
+        return td.sum() if not td.empty else timedelta(0)
+    
+    def calculate_missing_app_usage(self):
+        return (self.screen_time.timedelta_screentime - self.screen_time.timedelta_app_usage).sum()
+    
+    def get_missing_app_usage_timestamps(self):
+        return self.screen_time[(self.screen_time.timedelta_screentime - self.screen_time.timedelta_app_usage) != timedelta(0)].timestamp.to_list()
+    
+    def get_overlapping_screen_time(self):
+        # screen_on periods can't overlap
+        return self.screen_time[self.screen_time['datetime_end'] > self.screen_time['datetime_start'].shift(-1)].timestamp.to_list()
+        
+    def diagnostics(self):
+        return {
+            "missing_app_usage_total": self.calculate_missing_app_usage(),
+            "missing_app_usage_timestamps": self.get_missing_app_usage_timestamps(),
+            "overlapping_screen_time": self.get_overlapping_screen_time()
+        }
 
 class Pipeline:
 
