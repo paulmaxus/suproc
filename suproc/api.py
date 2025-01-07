@@ -5,6 +5,7 @@ import zipfile
 
 from pathlib import Path
 from datetime import timedelta
+from typing import Dict
 
 
 class DataLoader:
@@ -103,14 +104,23 @@ class Processor:
         by_esm = []
         for formc, ffdt in zip(self.esm.formc, self.esm.form_finish_datetime):
             df = self._filter_by_hours_prior(df_in, event_time=ffdt, hours=hours_prior)
-            df["screentime"] = df.datetime_end.apply(lambda x: min(x, ffdt)) - df.datetime_start  # maximum screentime is until end of esm
+            if df.empty:
+                continue
+            df["time"] = df.datetime_end.apply(lambda x: min(x, ffdt)) - df.datetime_start  # maximum is until end of esm
             # Unit should be minutes
-            df["screentime"] = df.screentime.apply(lambda x: x.total_seconds() / 60)
+            try:
+                df["time"] = df.time.dt.total_seconds() / 60
+            except AttributeError:
+                print(f"No total_seconds() method for {df['time']}")
+                raise AttributeError
+            #df["time"] = df.time.dt.total_seconds() / 60
+            # Convert type to float, otherwise sum() might result in wrong type for time=0
+            #df["time"] = df.time.astype(float)
             if group:
-                df = df.groupby(group).screentime.sum().reset_index()
+                df = df.groupby(group).time.sum().reset_index()
                 by_esm.append((formc, df))
             else:
-                by_esm.append((formc, df.screentime.sum()))
+                by_esm.append((formc, df.time.sum()))
         return by_esm
     
     def by_period(self, df_in, period="day", group=None):
@@ -139,7 +149,7 @@ class Processor:
 
         df["new_datetime_start"] = df[['datetime_start','datetime_start_period']].max(axis=1)
         df["new_datetime_end"] = df[['datetime_end','datetime_end_period']].min(axis=1)
-        df["screentime"] = df.new_datetime_end - df.new_datetime_start
+        df["time"] = df.new_datetime_end - df.new_datetime_start
 
         match period: 
             case "day":
@@ -150,9 +160,9 @@ class Processor:
                 df["by_period"] = df.period.apply(lambda x: x.hour)
 
         extra_group = [group] if group is not None else []
-        df =  df.groupby(["by_period"] + extra_group).screentime.sum().reset_index()
+        df =  df.groupby(["by_period"] + extra_group).time.sum().reset_index()
         # Unit in minutes is required
-        df["screentime"] = df.screentime.apply(lambda x: x.total_seconds() / 60)
+        df["time"] = df.time.apply(lambda x: x.total_seconds() / 60)
         return df
 
 
@@ -181,10 +191,11 @@ class ScreenTime(Processor):
         screen_time = super().by_esm(self.screen_time, hours_prior=hours_prior)
         if not screen_time:
             return pd.DataFrame()
-        return pd.DataFrame(screen_time, columns=["formc","screen_time"])
+        return pd.DataFrame(screen_time, columns=["formc","screentime"])
     
     def by_period(self, period="day"):
         screen_time = super().by_period(self.screen_time, period=period)
+        screen_time.rename(columns={"time": "screentime"}, inplace=True)
         # For plotting, set index
         return screen_time.set_index("by_period")
     
@@ -193,14 +204,14 @@ class AppUsage(Processor):
     def __init__(self, data: Data, all_apps=False):
         super().__init__(data)
         self.platforms = [
-            "facebook", 
-            "messenger", 
-            "instagram", 
+            "facebook.katana", 
+            "facebook.orca",  # messenger 
+            "instagram",  # includes umatech.instagram, get.instagram.follower
             "twitter", 
             "snapchat", 
             "tiktok", 
-            "youtube", 
-            "whatsapp", 
+            "youtube",  # includes vanced.android.youtube
+            "whatsapp",  # includes whatsapp.w4b
             "telegram", 
             "viber", 
             "pinterest", 
@@ -209,14 +220,25 @@ class AppUsage(Processor):
         self.app_usage = self._preprocess_app_usage(data.app_usage, all_apps=all_apps)
 
 
-    def _preprocess_app_usage(self, app_usage, all_apps):
+    def _preprocess_app_usage(self, app_usage, all_apps, check_platforms=False):
         df = app_usage.copy()
+        # sometimes timestamps are not unique, but that's okay for app usage
+        df = df.sort_values(by="timestamp", ascending=True)  # just make sure they are sorted
         df["datetime_start"] = df.timestamp.apply(lambda x: self.ts_start + datetime.timedelta(seconds=x))
-        df["datetime_end"] = df.datetime_start.shift(-1)
+        df["datetime_end"] = df.datetime_start.shift(-1) 
         # Remove last event as we don't know when it ended
         df = df.iloc[:-1,:]
+        # Remove screen_on events: if app usage is missing then screen_on would count torwards app usage
+        df = df[df.event != "com.android/android.intent.action.SCREEN_ON"]
         # Add platform
+        # App name is in first part
+        df["event"] = df.event.str.split("/").str[0]
         df['platform'] = df.event.str.extract(f"({'|'.join(self.platforms)})")
+        if check_platforms:
+            # Check whether platform events are unique
+            events = df.groupby("platform").event
+            if events.nunique().max() > 1: 
+                print(f"platform events are not unique: {events.unique()}")
         # Remove events with no platform
         if not all_apps:
             df = df[~pd.isna(df.platform)]
@@ -232,12 +254,55 @@ class AppUsage(Processor):
         if app_time.empty:
             return app_time
         else:
-            return app_time.pivot(index="formc", columns="platform", values="screentime")
+            return app_time.pivot(index="formc", columns="platform", values="time")
     
     def by_period(self, period="day"):
         app_time = super().by_period(self.app_usage, period=period, group="platform")
         # For plotting, pivot and set index
-        return app_time.reset_index().pivot(index="by_period", columns="platform", values="screentime")
+        return app_time.reset_index().pivot(index="by_period", columns="platform", values="time")
+    
+class MissingAppUsage(Processor):
+    
+    def __init__(self, data: Data):
+        super().__init__(data)
+        self.missing_app_usage = self._get_missing_app_usage(ScreenTime(data).screen_time, AppUsage(data, all_apps=True).app_usage)
+
+    def _get_missing_app_usage(self, st, au):
+        missing_periods = []
+        for _, row in st.iterrows():
+            missing_periods.extend(self._get_missing_app_usage_by_period(row["datetime_start"], row["datetime_end"], au))
+        return pd.DataFrame(missing_periods, columns=["datetime_start", "datetime_end"])
+
+    def _get_missing_app_usage_by_period(self, st_start, st_end, au):
+        missing_periods = []
+        au_periods = au[(au["datetime_start"] < st_end) & (au["datetime_end"] > st_start)]
+        if au_periods.empty:
+            # No app usage, add the entire period
+            missing_periods.append((st_start, st_end))
+        else:
+             # Process overlapping periods
+            current_start = st_start
+            for _, row in au_periods.iterrows():
+                # If there's a gap before this period, add it
+                if current_start < row["datetime_start"]:
+                    missing_periods.append((current_start, row["datetime_start"]))
+                current_start = max(current_start, row["datetime_end"])
+            # Add any remaining period after the last overlap
+            if current_start < st_end:
+                missing_periods.append((current_start, st_end)) 
+        return missing_periods
+    
+    def by_esm(self, hours_prior=2):
+        missing_app_usage = super().by_esm(self.missing_app_usage, hours_prior=hours_prior)
+        if not missing_app_usage:
+            return pd.DataFrame()
+        return pd.DataFrame(missing_app_usage, columns=["formc","missing_app_usage"])
+    
+    def by_period(self, period="day"):
+        missing_app_usage = super().by_period(self.missing_app_usage, period=period)
+        missing_app_usage.rename(columns={"time": "missing_app_usage"}, inplace=True)
+        # For plotting, set index
+        return missing_app_usage.set_index("by_period")
 
 class Diagnostics:
 
@@ -268,6 +333,18 @@ class Diagnostics:
             "missing_app_usage_timestamps": self.get_missing_app_usage_timestamps(),
             "overlapping_screen_time": self.get_overlapping_screen_time()
         }
+    
+class DynamicOutput:
+    def __init__(self):
+        self._dataframes: Dict[str, pd.DataFrame] = {}
+    
+    def __getattr__(self, name: str):
+        if name in self._dataframes:
+            return self._dataframes[name]
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+    
+    def add_dataframe(self, name: str, df: pd.DataFrame):
+        self._dataframes[name] = df
 
 class Pipeline:
 
@@ -278,6 +355,7 @@ class Pipeline:
         self.hours_prior = hours_prior
 
     def run(self):
+        output = DynamicOutput()
         dfp_all = pd.DataFrame()
         dfe_all = pd.DataFrame()
         for data in self.data_loader:
@@ -298,9 +376,11 @@ class Pipeline:
                 elif not be.empty:
                     dfe = pd.merge(dfe, be, how="outer", on="formc")
             if not dfp.empty:
-                dfp["id"] = data.id
+                dfp.insert(0, "id", data.id)
                 dfp_all = pd.concat([dfp_all, dfp])
             if not dfe.empty:
-                dfe["id"] = data.id
+                dfe.insert(0, "id", data.id)
                 dfe_all = pd.concat([dfe_all, dfe])
-        return dfp_all, dfe_all
+        output.add_dataframe('by_period', dfp_all)
+        output.add_dataframe('by_esm', dfe_all)
+        return output
