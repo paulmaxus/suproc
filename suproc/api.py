@@ -9,7 +9,16 @@ from typing import Dict
 
 
 class DataLoader:
-    def __init__(self, path_to_trace_data="./data/trace_data", path_to_esm_file="./data/esm.csv", esm_all_columns=False):
+    """
+    Generator that loads a participant's trace data from a folder and ESM data from a CSV.
+    """
+    def __init__(self, path_to_trace_data: str = "./data/trace_data", path_to_esm_file: str = "./data/esm.csv", esm_all_columns: bool = False):
+        """
+        Args:
+            path_to_trace_data (str): The path to the folder containing the trace data subfolders.
+            path_to_esm_file (str): The path to the CSV file containing the ESM data (one for all participants).
+            esm_all_columns (bool): Whether to load all columns from the ESM file.
+        """
         self.data_folder = Path(path_to_trace_data)
         self.folders = [x for x in self.data_folder.glob("**/*") if x.is_dir()]
         self.esm = self._load_esm(Path(path_to_esm_file), all_columns=esm_all_columns)
@@ -20,6 +29,7 @@ class DataLoader:
         return self
 
     def __next__(self):
+        # Return the next participant
         if self.current < self.n:
             # For each participant, create esm subset
             try:
@@ -56,7 +66,9 @@ class DataLoader:
 
 
 class Data:
-
+    """
+    Class that represents a participant's data. Reads files when instantiated.
+    """
     def __init__(self, folder, esm=None):
         self.folder = folder
         self.id = folder.stem
@@ -68,12 +80,21 @@ class Data:
 
     def _load(self, logs=False):
         if logs:
+            # alternative data format: zipped files
             self._load_logs(self._read_files)
         else:
             with open(self.folder / "unisens.xml") as file1, open(self.folder / "AppUsage.csv") as file2, open(self.folder / "DisplayOn.csv") as file3:
                 self._read_files(file1, file2, file3)
 
     def _read_files(self, file1, file2, file3):
+        """
+        Reads the three files that contain the participant's data.
+
+        Args:
+            file1: the file containing the unisens data (needed for start time)
+            file2: the file containing the app usage data
+            file3: the file containing the display on data
+        """
         self.config = ET.parse(file1).getroot().attrib
         self.app_usage = pd.read_csv(file2, header=None, names=["timestamp","app","event"])
         self.display_on = pd.read_csv(file3, header=None, names=["timestamp", "is_on"])
@@ -89,6 +110,9 @@ class Data:
     
 
 class Processor:
+    """
+    Superclass for data processing.
+    """
     def __init__(self, data: Data):
         self.esm = data.esm.copy()[["formc","form_finish_datetime"]] if not data.esm is None else None
         self.ts_start = datetime.datetime.strptime(data.config["timestampStart"], '%Y-%m-%dT%H:%M:%S.%f')
@@ -99,6 +123,17 @@ class Processor:
         return df
     
     def by_esm(self, df_in, hours_prior=2, group=None):
+        """
+        Aggregate the processed data (as time spent) by ESM form within a specified number of hours prior to each form.
+
+        Args:
+            df_in (pd.DataFrame): Input DataFrame containing events with 'datetime_start' and 'datetime_end' columns.
+            hours_prior (int): Number of hours prior to the ESM form finish time to consider. Default is 2.
+            group (str, optional): Column name to group by for summing the time. If None, total time is summed without grouping.
+
+        Returns:
+            list: A list of tuples containing formc and either a DataFrame with grouped times or total time for each ESM form.
+        """
         if self.esm is None:
             return
         by_esm = []
@@ -107,15 +142,8 @@ class Processor:
             if df.empty:
                 continue
             df["time"] = df.datetime_end.apply(lambda x: min(x, ffdt)) - df.datetime_start  # maximum is until end of esm
-            # Unit should be minutes
-            try:
-                df["time"] = df.time.dt.total_seconds() / 60
-            except AttributeError:
-                print(f"No total_seconds() method for {df['time']}")
-                raise AttributeError
-            #df["time"] = df.time.dt.total_seconds() / 60
-            # Convert type to float, otherwise sum() might result in wrong type for time=0
-            #df["time"] = df.time.astype(float)
+            # in minutes
+            df["time"] = df.time.dt.total_seconds() / 60
             if group:
                 df = df.groupby(group).time.sum().reset_index()
                 by_esm.append((formc, df))
@@ -123,8 +151,18 @@ class Processor:
                 by_esm.append((formc, df.time.sum()))
         return by_esm
     
-    def by_period(self, df_in, period="day", group=None):
+    def by_period(self, df_in, period="day", group=None):  
+        """
+        Aggregates the processed data (as time spent) into specified periods and optionally groups by a category.
 
+        Args:
+            df_in (pd.DataFrame): Input DataFrame containing events with 'datetime_start' and 'datetime_end' columns.
+            period (str): The period to aggregate by. Must be 'day', 'weekday', or 'hour'. Default is 'day'.
+            group (str, optional): Column name to group by for summing the time within each period. If None, no grouping is applied.
+
+        Returns:
+            pd.DataFrame: A DataFrame with aggregated time for each period (and group, if specified), with time in minutes.
+        """
         period_map = {
             "day": "D",
             "weekday": "D",
@@ -161,13 +199,17 @@ class Processor:
 
         extra_group = [group] if group is not None else []
         df =  df.groupby(["by_period"] + extra_group).time.sum().reset_index()
-        # Unit in minutes is required
-        df["time"] = df.time.apply(lambda x: x.total_seconds() / 60)
+        if df.empty:
+            return df
+        # in minutes
+        df["time"] = df.time.dt.total_seconds() / 60
         return df
 
 
 class ScreenTime(Processor):
-
+    """
+    Class for processing screen time data.
+    """
     def __init__(self, data: Data):
         super().__init__(data)
         self.screen_time = self._preprocess_display_on(data.display_on)
@@ -200,7 +242,9 @@ class ScreenTime(Processor):
         return screen_time.set_index("by_period")
     
 class AppUsage(Processor):
-
+    """
+    Class for processing app usage data.
+    """
     def __init__(self, data: Data, all_apps=False):
         super().__init__(data)
         self.platforms = [
@@ -262,18 +306,41 @@ class AppUsage(Processor):
         return app_time.reset_index().pivot(index="by_period", columns="platform", values="time")
     
 class MissingAppUsage(Processor):
-    
+    """
+    Class for processing screen time and app usage data to compute periods of missing app usage.
+    """
     def __init__(self, data: Data):
         super().__init__(data)
         self.missing_app_usage = self._get_missing_app_usage(ScreenTime(data).screen_time, AppUsage(data, all_apps=True).app_usage)
 
     def _get_missing_app_usage(self, st, au):
+        """
+        Compute periods of missing app usage for each screen time period.
+
+        Args:
+            st (pd.DataFrame): Screen time DataFrame with datetime_start and datetime_end columns.
+            au (pd.DataFrame): App usage DataFrame with datetime_start and datetime_end columns.
+
+        Returns:
+            pd.DataFrame: A DataFrame with datetime_start and datetime_end columns, containing the missing app usage periods.
+        """
         missing_periods = []
         for _, row in st.iterrows():
             missing_periods.extend(self._get_missing_app_usage_by_period(row["datetime_start"], row["datetime_end"], au))
         return pd.DataFrame(missing_periods, columns=["datetime_start", "datetime_end"])
 
     def _get_missing_app_usage_by_period(self, st_start, st_end, au):
+        """
+        Compute periods of missing app usage for a single screen time period.
+
+        Args:
+            st_start (datetime): Start of the screen time period.
+            st_end (datetime): End of the screen time period.
+            au (pd.DataFrame): App usage DataFrame with datetime_start and datetime_end columns.
+
+        Returns:
+            list: A list of tuples containing datetime_start and datetime_end of the missing app usage periods.
+        """
         missing_periods = []
         au_periods = au[(au["datetime_start"] < st_end) & (au["datetime_end"] > st_start)]
         if au_periods.empty:
@@ -305,7 +372,11 @@ class MissingAppUsage(Processor):
         return missing_app_usage.set_index("by_period")
 
 class Diagnostics:
+    """
+    Class for computing diagnostics.
 
+    TODO probably not needed.
+    """
     def __init__(self, screen_time, app_usage):
         self.screen_time = screen_time.screen_time.copy()
         self.app_usage = app_usage.app_usage.copy()
@@ -335,6 +406,9 @@ class Diagnostics:
         }
     
 class DynamicOutput:
+    """
+    Class for storing output dataframes. Access dataframes by name.
+    """
     def __init__(self):
         self._dataframes: Dict[str, pd.DataFrame] = {}
     
@@ -347,7 +421,9 @@ class DynamicOutput:
         self._dataframes[name] = df
 
 class Pipeline:
-
+    """
+    Class for running a pipeline of processors on a DataLoader to process all participants.
+    """
     def __init__(self, data_loader: DataLoader, processors: list[Processor], period="day", hours_prior=2):
         self.data_loader = data_loader
         self.processors = processors
@@ -355,6 +431,7 @@ class Pipeline:
         self.hours_prior = hours_prior
 
     def run(self):
+        """Runs the pipeline and returns a DynamicOutput object."""
         output = DynamicOutput()
         dfp_all = pd.DataFrame()
         dfe_all = pd.DataFrame()
