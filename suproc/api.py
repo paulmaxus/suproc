@@ -2,11 +2,11 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import datetime
 import zipfile
-
+import abc
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import timedelta
-from typing import Dict
-
+from typing import Dict, List, Optional, Tuple, Union, Iterator
 
 class DataLoader:
     """
@@ -65,26 +65,33 @@ class DataLoader:
         return df
 
 
+@dataclass
 class Data:
     """
     Class that represents a participant's data. Reads files when instantiated.
     """
-    def __init__(self, folder, esm=None):
-        self.folder = folder
-        self.id = folder.stem
-        self.esm = esm
-        self.config = None
-        self.app_usage = None
-        self.display_on = None
+    folder: Path
+    esm: Optional[pd.DataFrame] = None
+    config: Optional[Dict] = None
+    app_usage: Optional[pd.DataFrame] = None
+    display_on: Optional[pd.DataFrame] = None
+    
+    def __post_init__(self):
+        self.id = self.folder.stem
         self._load()
 
-    def _load(self, logs=False):
-        if logs:
-            # alternative data format: zipped files
-            self._load_logs(self._read_files)
-        else:
-            with open(self.folder / "unisens.xml") as file1, open(self.folder / "AppUsage.csv") as file2, open(self.folder / "DisplayOn.csv") as file3:
-                self._read_files(file1, file2, file3)
+    def _load(self, logs: bool = False) -> None:
+        try:
+            if logs:
+                # alternative data format: zipped files
+                self._load_logs(self._read_files)
+            else:
+                with open(self.folder / "unisens.xml") as file1, \
+                     open(self.folder / "AppUsage.csv") as file2, \
+                     open(self.folder / "DisplayOn.csv") as file3:
+                    self._read_files(file1, file2, file3)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Required data files not found in {self.folder}: {str(e)}")
 
     def _read_files(self, file1, file2, file3):
         """
@@ -107,22 +114,30 @@ class Data:
         with zipfile.ZipFile(log_folders[0], 'r') as zip_ref:
             with zip_ref.open("unisens.xml") as file1, zip_ref.open("AppUsage.csv") as file2, zip_ref.open("DisplayOn.csv") as file3:
                 file_reader(file1, file2, file3)
-    
 
-class Processor:
+
+class Processor(abc.ABC):
     """
-    Superclass for data processing.
+    Abstract base class for data processing.
     """
     def __init__(self, data: Data):
-        self.esm = data.esm.copy()[["formc","form_finish_datetime"]] if not data.esm is None else None
+        if data.esm is not None:
+            self.esm = data.esm[["formc", "form_finish_datetime"]].copy()
+        else:
+            self.esm = None
         self.ts_start = datetime.datetime.strptime(data.config["timestampStart"], '%Y-%m-%dT%H:%M:%S.%f')
 
-    def _filter_by_hours_prior(self, df_in, event_time, hours=2):
+    def _filter_by_hours_prior(self, df_in: pd.DataFrame, event_time: datetime.datetime, hours: int = 2) -> pd.DataFrame:
         df = df_in.copy()
-        df = df[(df.datetime_start >= event_time - datetime.timedelta(hours=hours)) & (df.datetime_start < event_time)]
+        time_window = datetime.timedelta(hours=hours)
+        df = df[
+            (df.datetime_start >= event_time - time_window) & 
+            (df.datetime_start < event_time)
+        ]
         return df
-    
-    def by_esm(self, df_in, hours_prior=2, group=None):
+
+    @abc.abstractmethod
+    def by_esm(self, df_in: pd.DataFrame, hours_prior: int = 2, group: Optional[str] = None) -> List[Tuple]:
         """
         Aggregate the processed data (as time spent) by ESM form within a specified number of hours prior to each form.
 
@@ -135,7 +150,7 @@ class Processor:
             list: A list of tuples containing formc and either a DataFrame with grouped times or total time for each ESM form.
         """
         if self.esm is None:
-            return
+            return []
         by_esm = []
         for formc, ffdt in zip(self.esm.formc, self.esm.form_finish_datetime):
             df = self._filter_by_hours_prior(df_in, event_time=ffdt, hours=hours_prior)
@@ -150,8 +165,9 @@ class Processor:
             else:
                 by_esm.append((formc, df.time.sum()))
         return by_esm
-    
-    def by_period(self, df_in, period="day", group=None):  
+
+    @abc.abstractmethod
+    def by_period(self, df_in: pd.DataFrame, period: str = "day", group: Optional[str] = None) -> pd.DataFrame:
         """
         Aggregates the processed data (as time spent) into specified periods and optionally groups by a category.
 
@@ -174,7 +190,7 @@ class Processor:
 
         df = df_in.copy()
         s = []
-        for x,y in zip(df.datetime_start, df.datetime_end):
+        for x, y in zip(df.datetime_start, df.datetime_end):
             pr = pd.period_range(x, y, freq=freq)
             s.append(pr)
         df["period"] = s
@@ -185,11 +201,11 @@ class Processor:
         df["datetime_end_period"] = df.period + 1
         df["datetime_end_period"] = df.datetime_end_period.apply(lambda x: x.to_timestamp(freq=freq))
 
-        df["new_datetime_start"] = df[['datetime_start','datetime_start_period']].max(axis=1)
-        df["new_datetime_end"] = df[['datetime_end','datetime_end_period']].min(axis=1)
+        df["new_datetime_start"] = df[['datetime_start', 'datetime_start_period']].max(axis=1)
+        df["new_datetime_end"] = df[['datetime_end', 'datetime_end_period']].min(axis=1)
         df["time"] = df.new_datetime_end - df.new_datetime_start
 
-        match period: 
+        match period:
             case "day":
                 df["by_period"] = df.period
             case "weekday":
@@ -198,13 +214,12 @@ class Processor:
                 df["by_period"] = df.period.apply(lambda x: x.hour)
 
         extra_group = [group] if group is not None else []
-        df =  df.groupby(["by_period"] + extra_group).time.sum().reset_index()
+        df = df.groupby(["by_period"] + extra_group).time.sum().reset_index()
         if df.empty:
             return df
         # in minutes
         df["time"] = df.time.dt.total_seconds() / 60
         return df
-
 
 class ScreenTime(Processor):
     """
@@ -240,7 +255,8 @@ class ScreenTime(Processor):
         screen_time.rename(columns={"time": "screentime"}, inplace=True)
         # For plotting, set index
         return screen_time.set_index("by_period")
-    
+
+
 class AppUsage(Processor):
     """
     Class for processing app usage data.
@@ -304,7 +320,8 @@ class AppUsage(Processor):
         app_time = super().by_period(self.app_usage, period=period, group="platform")
         # For plotting, pivot and set index
         return app_time.reset_index().pivot(index="by_period", columns="platform", values="time")
-    
+
+
 class MissingAppUsage(Processor):
     """
     Class for processing screen time and app usage data to compute periods of missing app usage.
@@ -371,6 +388,7 @@ class MissingAppUsage(Processor):
         # For plotting, set index
         return missing_app_usage.set_index("by_period")
 
+
 class Diagnostics:
     """
     Class for computing diagnostics.
@@ -404,21 +422,26 @@ class Diagnostics:
             "missing_app_usage_timestamps": self.get_missing_app_usage_timestamps(),
             "overlapping_screen_time": self.get_overlapping_screen_time()
         }
-    
+
+
 class DynamicOutput:
     """
     Class for storing output dataframes. Access dataframes by name.
     """
     def __init__(self):
         self._dataframes: Dict[str, pd.DataFrame] = {}
-    
-    def __getattr__(self, name: str):
+
+    def __getattr__(self, name: str) -> pd.DataFrame:
         if name in self._dataframes:
             return self._dataframes[name]
-        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-    
-    def add_dataframe(self, name: str, df: pd.DataFrame):
+        raise AttributeError(f"No dataframe named '{name}' exists")
+
+    def add_dataframe(self, name: str, df: pd.DataFrame) -> None:
+        """Add a new dataframe to the collection."""
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("Value must be a pandas DataFrame")
         self._dataframes[name] = df
+
 
 class Pipeline:
     """
