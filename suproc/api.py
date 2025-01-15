@@ -231,8 +231,9 @@ class ScreenTime(Processor):
 
     def _preprocess_display_on(self, display_on):
         df = display_on.copy()
-        # sometimes timestamps are not unique!
-        df = df.drop_duplicates(subset=["timestamp"], keep="first")
+        # sometimes timestamps are not unique (sampling frequency is 1hz)
+        # but removing them would distort datetime_end
+        #df = df.drop_duplicates(subset=["timestamp"], keep="first")
         df = df.sort_values(by="timestamp", ascending=True)
         df["datetime_start"] = df.timestamp.apply(lambda x: self.ts_start + datetime.timedelta(seconds=x))
         df["datetime_end"] = df.datetime_start.shift(-1)
@@ -260,6 +261,8 @@ class ScreenTime(Processor):
 class AppUsage(Processor):
     """
     Class for processing app usage data.
+
+    App usage is measured from current event trigger to next event trigger.
     """
     def __init__(self, data: Data, all_apps=False):
         super().__init__(data)
@@ -282,14 +285,16 @@ class AppUsage(Processor):
 
     def _preprocess_app_usage(self, app_usage, all_apps, check_platforms=False):
         df = app_usage.copy()
-        # sometimes timestamps are not unique, but that's okay for app usage
+        # sometimes timestamps are not unique (sampling frequency is 1hz)
+        # but removing them would distort datetime_end
         df = df.sort_values(by="timestamp", ascending=True)  # just make sure they are sorted
         df["datetime_start"] = df.timestamp.apply(lambda x: self.ts_start + datetime.timedelta(seconds=x))
         df["datetime_end"] = df.datetime_start.shift(-1) 
         # Remove last event as we don't know when it ended
         df = df.iloc[:-1,:]
-        # Remove screen_on events: if app usage is missing then screen_on would count torwards app usage
+        # Remove screen events as they are not app usage
         df = df[df.event != "com.android/android.intent.action.SCREEN_ON"]
+        df = df[df.event != "com.android/android.intent.action.SCREEN_OFF"]
         # Add platform
         # App name is in first part
         df["event"] = df.event.str.split("/").str[0]
